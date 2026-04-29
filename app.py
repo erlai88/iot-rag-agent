@@ -72,6 +72,18 @@ def resolve_embedding_api_key(manual_api_key: str) -> str:
     ).strip()
 
 
+def has_secret_embedding_key() -> bool:
+    """Return whether an embedding key is already configured via secrets or env."""
+    return bool(
+        ("EMBEDDING_API_KEY" in st.secrets and str(st.secrets["EMBEDDING_API_KEY"]).strip())
+        or ("ZHIPUAI_API_KEY" in st.secrets and str(st.secrets["ZHIPUAI_API_KEY"]).strip())
+        or ("OPENAI_API_KEY" in st.secrets and str(st.secrets["OPENAI_API_KEY"]).strip())
+        or os.getenv("EMBEDDING_API_KEY")
+        or os.getenv("ZHIPUAI_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+
+
 def resolve_llm_api_key() -> str:
     """Resolve the LLM API key from secrets or env."""
     if "LLM_API_KEY" in st.secrets:
@@ -257,12 +269,13 @@ def main() -> None:
     st.title("IoT RAG Agent")
     st.caption("Upload PDF manuals, build a knowledge base, and chat with retrieval + tools.")
 
-    manual_embedding_api_key = st.sidebar.text_input("Embedding API Key", type="password")
+    if has_secret_embedding_key():
+        manual_embedding_api_key = ""
+        st.sidebar.caption("Embedding key is configured in deployment settings.")
+    else:
+        manual_embedding_api_key = st.sidebar.text_input("Embedding API Key", type="password")
     embedding_api_key = resolve_embedding_api_key(manual_embedding_api_key)
     llm_api_key = resolve_llm_api_key()
-
-    if embedding_api_key and not manual_embedding_api_key.strip():
-        st.sidebar.caption("Embedding key detected from deployment config.")
     if llm_api_key:
         st.sidebar.caption("LLM key detected from deployment config.")
 
