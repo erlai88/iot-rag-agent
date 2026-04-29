@@ -8,13 +8,13 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-# Set this before importing modules that pull in chromadb/opentelemetry.
+# Set this before importing modules that may pull in protobuf-heavy packages.
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from chain import ask
+from chain import UserFacingError, stream_answer
 from ingest import DATA_DIR, ingest_pdfs, list_knowledge_base_documents
 from logger import build_bad_case_report, update_feedback
 
@@ -103,6 +103,24 @@ def resolve_llm_api_key() -> str:
     ).strip()
 
 
+def get_chat_history() -> list[dict[str, str]]:
+    """Convert session messages into model-ready chat history."""
+    history = []
+    for message in st.session_state.messages:
+        if message["role"] == "user":
+            history.append({"role": "user", "content": message["content"]})
+        elif message["role"] == "assistant":
+            history.append({"role": "assistant", "content": message["answer"]})
+    return history
+
+
+def friendly_error_message(exc: Exception) -> str:
+    """Map internal errors to user-facing messages."""
+    if isinstance(exc, UserFacingError):
+        return str(exc)
+    return "The service ran into a temporary problem. Please try again in a moment."
+
+
 def save_uploaded_files(uploaded_files: list) -> list[Path]:
     """Save uploaded PDFs into the local data directory."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -135,11 +153,15 @@ def render_sidebar(embedding_api_key: str) -> None:
             else:
                 try:
                     saved_paths = save_uploaded_files(uploaded_files)
-                    with st.spinner("Parsing and ingesting PDFs..."):
+                    with st.status("Ingesting documents...", expanded=True) as status:
+                        status.write("Saving uploaded files to the workspace...")
+                        status.write("Parsing PDF text and splitting chunks...")
                         total_chunks = ingest_pdfs(saved_paths, api_key=embedding_api_key)
+                        status.write("Embedding chunks and updating the knowledge base...")
+                        status.update(label="Ingest complete", state="complete")
                     st.success(f"Ingest complete. Added {total_chunks} chunks.")
                 except Exception as exc:
-                    st.error(f"Ingest failed: {exc}")
+                    st.error(friendly_error_message(exc))
 
         kb_docs = list_knowledge_base_documents()
         total_chunks = sum(int(item["chunk_count"]) for item in kb_docs)
@@ -171,8 +193,13 @@ def render_sources(sources: list[dict]) -> None:
             st.write("None")
             return
 
-        for source in sources:
-            st.write(f"- {source.get('source')} | page {source.get('page')}")
+        for index, source in enumerate(sources, start=1):
+            st.markdown(
+                f"**{index}. {source.get('source')}** | page {source.get('page')} | score {source.get('score'):.4f}"
+            )
+            snippet = (source.get("text") or "").strip()
+            if snippet:
+                st.caption(snippet[:300] + ("..." if len(snippet) > 300 else ""))
 
 
 def render_feedback_controls(message: dict) -> None:
@@ -236,20 +263,30 @@ def handle_user_input(embedding_api_key: str, llm_api_key: str) -> None:
     st.session_state.messages.append({"role": "user", "content": user_query})
 
     try:
-        with st.spinner("Searching documents and generating an answer..."):
-            result = ask(
-                user_query,
-                embedding_api_key=embedding_api_key,
-                llm_api_key=llm_api_key,
-            )
+        with st.chat_message("assistant"):
+            with st.status("Working on your question...", expanded=True) as status:
+                status.write("Searching the knowledge base with hybrid retrieval...")
+                answer_stream = stream_answer(
+                    user_query,
+                    embedding_api_key=embedding_api_key,
+                    llm_api_key=llm_api_key,
+                    chat_history=get_chat_history()[:-1],
+                )
+                status.write("Generating the answer from retrieved evidence...")
+                answer_text = st.write_stream(answer_stream)
+                result = answer_stream.result
+                if not result:
+                    raise UserFacingError("The assistant did not return a final answer.")
+                status.write("Preparing citations and logging the interaction...")
+                status.update(label="Answer complete", state="complete")
     except Exception as exc:
-        st.error(f"Question answering failed: {exc}")
+        st.error(friendly_error_message(exc))
         return
 
     st.session_state.messages.append(
         {
             "role": "assistant",
-            "answer": result["answer"],
+            "answer": answer_text if isinstance(answer_text, str) else result["answer"],
             "sources": result["sources"],
             "used_tool": result["used_tool"],
             "tool_result": result["tool_result"],

@@ -1,22 +1,24 @@
 """
 Main RAG pipeline.
 
-Flow:
-1. Retrieve Top-K document chunks.
-2. Ask the LLM with function calling enabled.
-3. Execute tool calls if requested.
-4. Return the final answer and log the interaction.
+Features:
+1. Hybrid retrieval with dense search + BM25 reranking
+2. Optional tool calling
+3. Streaming answer generation
+4. Conversation history support
+5. User-friendly exception mapping
 """
 
 from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass, field
 from getpass import getpass
-from typing import Any
+from typing import Any, Iterable
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI, RateLimitError
 
 from logger import log_interaction
 from retriever import Retriever
@@ -26,6 +28,11 @@ from tools import TOOLS_SCHEMA, handle_tool_call
 load_dotenv()
 
 TOP_K = 5
+MAX_HISTORY_MESSAGES = 6
+
+
+class UserFacingError(RuntimeError):
+    """Raised when a friendly message should be shown to end users."""
 
 
 def get_llm_model() -> str:
@@ -53,7 +60,7 @@ def get_embedding_api_key(api_key: str | None = None) -> str:
 
     input_key = getpass("Please enter the embedding API key: ").strip()
     if not input_key:
-        raise ValueError("Missing embedding API key.")
+        raise UserFacingError("Embedding API key is missing.")
     return input_key
 
 
@@ -72,7 +79,7 @@ def get_llm_api_key(api_key: str | None = None) -> str:
 
     input_key = getpass("Please enter the LLM API key: ").strip()
     if not input_key:
-        raise ValueError("Missing LLM API key.")
+        raise UserFacingError("LLM API key is missing.")
     return input_key
 
 
@@ -84,12 +91,30 @@ def build_llm_client(api_key: str) -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def map_llm_exception(exc: Exception) -> UserFacingError:
+    """Map provider exceptions to user-friendly messages."""
+    if isinstance(exc, AuthenticationError):
+        return UserFacingError("Model provider authentication failed. Please check the deployment secrets.")
+    if isinstance(exc, RateLimitError):
+        return UserFacingError("The model provider is rate-limiting requests right now. Please try again shortly.")
+    if isinstance(exc, APITimeoutError):
+        return UserFacingError("The model provider timed out. Please try again in a moment.")
+    if isinstance(exc, APIConnectionError):
+        return UserFacingError("The app could not reach the model provider. Please try again later.")
+    if isinstance(exc, APIStatusError):
+        return UserFacingError(f"Model provider returned an error ({exc.status_code}). Please try again later.")
+    if isinstance(exc, UserFacingError):
+        return exc
+    return UserFacingError("The assistant could not finish this request. Please try again.")
+
+
 def build_system_prompt() -> str:
     """Create the system prompt."""
     return (
         "You are an IoT support expert. Answer only from the provided documents. "
         "If the documents do not contain the answer, clearly say you do not know. "
-        "Do not invent details that are not present in the documents."
+        "Do not invent details that are not present in the documents. "
+        "When useful, cite the document source and page in your answer."
     )
 
 
@@ -112,6 +137,27 @@ def format_context(contexts: list[dict[str, Any]]) -> str:
             )
         )
     return "\n\n".join(blocks)
+
+
+def build_user_prompt(query: str, contexts: list[dict[str, Any]]) -> str:
+    """Build the user prompt for the current turn."""
+    return f"Document context:\n{format_context(contexts)}\n\nUser question:\n{query}"
+
+
+def normalize_chat_history(chat_history: Iterable[dict[str, str]] | None) -> list[dict[str, str]]:
+    """Keep only recent user/assistant turns for the model."""
+    if not chat_history:
+        return []
+
+    normalized = []
+    for item in chat_history:
+        role = item.get("role")
+        content = item.get("content", "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        normalized.append({"role": role, "content": content})
+
+    return normalized[-MAX_HISTORY_MESSAGES:]
 
 
 def serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
@@ -143,14 +189,28 @@ def parse_tool_result(tool_output: str) -> dict[str, Any] | None:
     return None
 
 
-def ask(
+@dataclass
+class PreparedInteraction:
+    """Prepared state for both blocking and streaming answer generation."""
+
+    client: OpenAI
+    model: str
+    query: str
+    contexts: list[dict[str, Any]]
+    final_messages: list[dict[str, Any]]
+    used_tool: bool
+    tool_result: dict[str, Any] | None
+
+
+def prepare_interaction(
     query: str,
     embedding_api_key: str | None = None,
     llm_api_key: str | None = None,
-) -> dict[str, Any]:
-    """Run one full RAG + tool-calling interaction."""
+    chat_history: Iterable[dict[str, str]] | None = None,
+) -> PreparedInteraction:
+    """Prepare retrieval, tool calls, and final messages for response generation."""
     if not query.strip():
-        raise ValueError("Query cannot be empty.")
+        raise UserFacingError("Question cannot be empty.")
 
     resolved_embedding_key = get_embedding_api_key(embedding_api_key)
     resolved_llm_key = get_llm_api_key(llm_api_key)
@@ -158,30 +218,29 @@ def ask(
     retriever = Retriever(api_key=resolved_embedding_key)
     client = build_llm_client(resolved_llm_key)
 
-    contexts = retriever.search(query=query, k=TOP_K)
-    context_text = format_context(contexts)
+    contexts = retriever.search_with_rerank(query=query, k=TOP_K)
+    history_messages = normalize_chat_history(chat_history)
+    base_messages: list[dict[str, Any]] = [{"role": "system", "content": build_system_prompt()}]
+    base_messages.extend(history_messages)
+    base_messages.append({"role": "user", "content": build_user_prompt(query, contexts)})
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt()},
-        {
-            "role": "user",
-            "content": f"Document context:\n{context_text}\n\nUser question:\n{query}",
-        },
-    ]
+    try:
+        first_response = client.chat.completions.create(
+            model=get_llm_model(),
+            messages=base_messages,
+            tools=TOOLS_SCHEMA,
+            tool_choice="auto",
+        )
+    except Exception as exc:
+        raise map_llm_exception(exc) from exc
 
-    first_response = client.chat.completions.create(
-        model=get_llm_model(),
-        messages=messages,
-        tools=TOOLS_SCHEMA,
-        tool_choice="auto",
-    )
     first_message = first_response.choices[0].message
-
     used_tool = bool(first_message.tool_calls)
     tool_result: dict[str, Any] | None = None
+    final_messages = list(base_messages)
 
     if used_tool:
-        messages.append(
+        final_messages.append(
             {
                 "role": "assistant",
                 "content": first_message.content or "",
@@ -194,14 +253,14 @@ def ask(
             try:
                 tool_args = json.loads(tool_call.function.arguments or "{}")
             except json.JSONDecodeError as exc:
-                raise ValueError(f"Tool arguments are not valid JSON: {tool_call.function.arguments}") from exc
+                raise UserFacingError("The tool call returned invalid JSON arguments.") from exc
 
             tool_output = handle_tool_call(tool_name, tool_args)
             parsed_output = parse_tool_result(tool_output)
             if parsed_output is not None:
                 tool_result = parsed_output
 
-            messages.append(
+            final_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -209,28 +268,112 @@ def ask(
                 }
             )
 
-        final_response = client.chat.completions.create(
-            model=get_llm_model(),
-            messages=messages,
-        )
-        answer = final_response.choices[0].message.content or ""
-    else:
-        answer = first_message.content or ""
+    return PreparedInteraction(
+        client=client,
+        model=get_llm_model(),
+        query=query,
+        contexts=contexts,
+        final_messages=final_messages,
+        used_tool=used_tool,
+        tool_result=tool_result,
+    )
 
+
+@dataclass
+class AnswerStream:
+    """Streaming wrapper that collects final answer metadata."""
+
+    interaction: PreparedInteraction
+    result: dict[str, Any] | None = field(default=None, init=False)
+
+    def __iter__(self):
+        answer_parts: list[str] = []
+        try:
+            stream = self.interaction.client.chat.completions.create(
+                model=self.interaction.model,
+                messages=self.interaction.final_messages,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                answer_parts.append(delta)
+                yield delta
+        except Exception as exc:
+            raise map_llm_exception(exc) from exc
+
+        answer = "".join(answer_parts)
+        self.result = {
+            "answer": answer,
+            "sources": self.interaction.contexts,
+            "used_tool": self.interaction.used_tool,
+            "tool_result": self.interaction.tool_result,
+        }
+        interaction_id = log_interaction(
+            query=self.interaction.query,
+            answer=answer,
+            sources=self.interaction.contexts,
+            used_tool=self.interaction.used_tool,
+            feedback=None,
+            tool_result=self.interaction.tool_result,
+        )
+        self.result["interaction_id"] = interaction_id
+
+
+def stream_answer(
+    query: str,
+    embedding_api_key: str | None = None,
+    llm_api_key: str | None = None,
+    chat_history: Iterable[dict[str, str]] | None = None,
+) -> AnswerStream:
+    """Return a streaming answer object for Streamlit rendering."""
+    interaction = prepare_interaction(
+        query=query,
+        embedding_api_key=embedding_api_key,
+        llm_api_key=llm_api_key,
+        chat_history=chat_history,
+    )
+    return AnswerStream(interaction=interaction)
+
+
+def ask(
+    query: str,
+    embedding_api_key: str | None = None,
+    llm_api_key: str | None = None,
+    chat_history: Iterable[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Run one full RAG + tool-calling interaction."""
+    interaction = prepare_interaction(
+        query=query,
+        embedding_api_key=embedding_api_key,
+        llm_api_key=llm_api_key,
+        chat_history=chat_history,
+    )
+
+    try:
+        final_response = interaction.client.chat.completions.create(
+            model=interaction.model,
+            messages=interaction.final_messages,
+        )
+    except Exception as exc:
+        raise map_llm_exception(exc) from exc
+
+    answer = final_response.choices[0].message.content or ""
     result = {
         "answer": answer,
-        "sources": contexts,
-        "used_tool": used_tool,
-        "tool_result": tool_result,
+        "sources": interaction.contexts,
+        "used_tool": interaction.used_tool,
+        "tool_result": interaction.tool_result,
     }
 
     interaction_id = log_interaction(
         query=query,
         answer=answer,
-        sources=contexts,
-        used_tool=used_tool,
+        sources=interaction.contexts,
+        used_tool=interaction.used_tool,
         feedback=None,
-        tool_result=tool_result,
+        tool_result=interaction.tool_result,
     )
     result["interaction_id"] = interaction_id
     return result
