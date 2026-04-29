@@ -1,0 +1,9 @@
+streamlit
+python-dotenv
+openai
+zhipuai
+langchain
+langchain-text-splitters
+pymupdf
+rank-bm25
+numpy

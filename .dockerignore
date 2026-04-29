@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.streamlit/
+chroma_db/
+logs/
+data/
+.git/
+.gitignore
+
